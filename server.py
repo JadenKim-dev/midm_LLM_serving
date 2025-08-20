@@ -1,11 +1,16 @@
 import torch
+import json
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, AsyncGenerator
 from contextlib import asynccontextmanager
 import uvicorn
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, TextIteratorStreamer
+from threading import Thread
+from queue import Queue, Empty
 
 
 # === Pydantic Models for Request/Response ===
@@ -83,7 +88,6 @@ class ModelManager:
         if self.model is None:
             raise ValueError("Model not loaded")
         
-        # 채팅 템플릿 적용
         input_ids = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -118,7 +122,6 @@ class ModelManager:
         input_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
         response_only = full_response[len(input_text):].strip()
         
-        # 사용 정보
         usage = {
             "prompt_tokens": input_token_count,
             "completion_tokens": output_token_count,
@@ -126,8 +129,59 @@ class ModelManager:
         }
         
         return response_only, usage
+    
+    def generate_stream(
+        self,
+        messages: List[Dict[str, str]],
+        max_new_tokens: int = 128,
+        temperature: float = 1.0,
+        do_sample: bool = False
+    ) -> AsyncGenerator[str, None]:
+        """스트리밍 응답 생성"""
+        
+        if self.model is None:
+            raise ValueError("Model not loaded")
+        
+        input_ids = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        )
+        
+        # 입력 텍스트 길이 저장 (응답만 추출하기 위해)
+        input_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        input_length = len(input_text)
+        
+        # 생성 설정
+        gen_config = GenerationConfig.from_dict(self.generation_config.to_dict())
+        gen_config.max_new_tokens = max_new_tokens
+        gen_config.temperature = temperature
+        gen_config.do_sample = do_sample
+        
+        # TextIteratorStreamer 설정
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            timeout=60.0
+        )
+        
+        # 생성 스레드 시작
+        generation_kwargs = dict(
+            input_ids=input_ids.to(self.device),
+            generation_config=gen_config,
+            eos_token_id=self.tokenizer.eos_token_id,
+            streamer=streamer
+        )
+        
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+        
+        return streamer, thread
 
 
+# 모델 매니저 인스턴스
 model_manager = ModelManager()
 
 
@@ -227,11 +281,69 @@ async def chat(request: ChatRequest):
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
     """
-    스트리밍 채팅 엔드포인트 (추후 구현 가능)
+    SSE 기반 스트리밍 채팅 엔드포인트
     
-    Server-Sent Events 또는 WebSocket을 통한 스트리밍 응답
+    Server-Sent Events를 통해 실시간으로 토큰을 스트리밍합니다.
     """
-    return {"message": "Streaming endpoint not implemented yet"}
+    async def generate_sse():
+        try:
+            messages = [msg.model_dump() for msg in request.messages]
+            
+            # 스트리머와 스레드 가져오기
+            streamer, thread = model_manager.generate_stream(
+                messages=messages,
+                max_new_tokens=request.max_new_tokens,
+                temperature=request.temperature,
+                do_sample=request.do_sample
+            )
+            
+            # SSE 시작 이벤트
+            yield f"data: {json.dumps({'type': 'start', 'message': 'Stream started'})}\n\n"
+            
+            generated_text = ""
+            token_count = 0
+            
+            for text_chunk in streamer:
+                if text_chunk:
+                    generated_text += text_chunk
+                    token_count += 1
+                    
+                    chunk_data = {
+                        'type': 'chunk',
+                        'content': text_chunk,
+                        'accumulated': generated_text,
+                        'token_count': token_count
+                    }
+                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                    
+                    await asyncio.sleep(0)
+            
+            thread.join()
+            
+            # 완료 이벤트
+            complete_data = {
+                'type': 'complete',
+                'full_response': generated_text,
+                'total_tokens': token_count
+            }
+            yield f"data: {json.dumps(complete_data, ensure_ascii=False)}\n\n"
+            
+            # SSE 종료 신호
+            yield "data: [DONE]\n\n"
+            
+        except Exception as e:
+            error_data = {'type': 'error', 'message': str(e)}
+            yield f"data: {json.dumps(error_data)}\n\n"
+    
+    return StreamingResponse(
+        generate_sse(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 # === Main Entry Point ===
