@@ -26,6 +26,8 @@ class ChatRequest(BaseModel):
     max_new_tokens: Optional[int] = Field(128, description="생성할 최대 토큰 수")
     temperature: Optional[float] = Field(1.0, description="샘플링 온도")
     do_sample: Optional[bool] = Field(False, description="샘플링 사용 여부")
+    context: Optional[List[str]] = Field(None, description="RAG로 검색된 컨텍스트 문서들")
+    use_rag_prompt: Optional[bool] = Field(False, description="RAG 전용 프롬프트 템플릿 사용 여부")
     
     class Config:
         json_schema_extra = {
@@ -131,6 +133,37 @@ class ModelManager:
         }
         
         return embeddings, usage
+    
+    def create_rag_prompt(self, messages: List[Dict[str, str]], context: List[str]) -> List[Dict[str, str]]:
+        if not context:
+            return messages
+        
+        context_text = "\n\n".join([f"[문서 {i+1}]\n{doc}" for i, doc in enumerate(context)])
+        
+        user_message = None
+        for msg in reversed(messages):
+            if msg["role"] == "user":
+                user_message = msg["content"]
+                break
+        
+        if user_message:
+            rag_instruction = f"""다음 문서들을 참고하여 질문에 답해주세요:
+
+{context_text}
+
+질문: {user_message}
+
+위 문서들의 내용을 바탕으로 정확하고 도움이 되는 답변을 제공해주세요."""
+            
+            rag_messages = []
+            for msg in messages:
+                if msg["role"] == "user" and msg["content"] == user_message:
+                    rag_messages.append({"role": "user", "content": rag_instruction})
+                else:
+                    rag_messages.append(msg)
+            return rag_messages
+        
+        return messages
     
     def generate_response(
         self, 
@@ -322,6 +355,9 @@ async def chat(request: ChatRequest):
     try:
         messages = [msg.model_dump() for msg in request.messages]
         
+        if request.context and request.use_rag_prompt:
+            messages = model_manager.create_rag_prompt(messages, request.context)
+        
         response_text, usage = model_manager.generate_response(
             messages=messages,
             max_new_tokens=request.max_new_tokens,
@@ -344,7 +380,8 @@ async def chat_stream(request: ChatRequest):
         try:
             messages = [msg.model_dump() for msg in request.messages]
             
-            # 스트리머와 스레드 가져오기
+            if request.context and request.use_rag_prompt:
+                messages = model_manager.create_rag_prompt(messages, request.context)
             streamer, thread = model_manager.generate_stream(
                 messages=messages,
                 max_new_tokens=request.max_new_tokens,
