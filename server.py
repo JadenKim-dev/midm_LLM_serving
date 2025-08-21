@@ -11,6 +11,8 @@ import uvicorn
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, TextIteratorStreamer
 from threading import Thread
 from queue import Queue, Empty
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 
 # === Pydantic Models for Request/Response ===
@@ -44,6 +46,18 @@ class ChatResponse(BaseModel):
     usage: Optional[Dict[str, int]] = Field(None, description="토큰 사용 정보")
 
 
+class EmbeddingRequest(BaseModel):
+    texts: List[str] = Field(..., description="임베딩을 생성할 텍스트 리스트")
+    model: Optional[str] = Field(None, description="사용할 임베딩 모델명 (선택사항)")
+
+
+class EmbeddingResponse(BaseModel):
+    embeddings: List[List[float]] = Field(..., description="생성된 임베딩 벡터들")
+    model: str = Field(..., description="사용된 모델명")
+    dimensions: int = Field(..., description="임베딩 벡터 차원수")
+    usage: Optional[Dict[str, int]] = Field(None, description="토큰 사용 정보")
+
+
 # === Global Model Storage ===
 class ModelManager:
     def __init__(self):
@@ -51,6 +65,7 @@ class ModelManager:
         self.tokenizer = None
         self.generation_config = None
         self.device = None
+        self.embedding_model = None
     
     def load_model(self, model_name: str):
         """모델을 메모리에 로드"""
@@ -75,6 +90,47 @@ class ModelManager:
         self.generation_config = GenerationConfig.from_pretrained(model_name)
         
         print("Model loaded successfully!")
+    
+    def load_embedding_model(self, embedding_model_name: str = "jhgan/ko-sroberta-multitask"):
+        print(f"Loading embedding model: {embedding_model_name}")
+        
+        try:
+            self.embedding_model = SentenceTransformer(embedding_model_name, device=self.device)
+            print(f"Embedding model loaded successfully! Dimensions: {self.embedding_model.get_sentence_embedding_dimension()}")
+        except Exception as e:
+            print(f"Failed to load embedding model: {e}")
+            raise
+    
+    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> tuple[List[List[float]], dict]:
+        if self.embedding_model is None:
+            raise ValueError("Embedding model not loaded")
+        
+        if not texts:
+            raise ValueError("No texts provided")
+        
+        embeddings = []
+        total_tokens = 0
+        
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            
+            batch_embeddings = self.embedding_model.encode(
+                batch_texts,
+                convert_to_numpy=True,
+                show_progress_bar=False
+            )
+            
+            batch_embeddings_list = [embedding.tolist() for embedding in batch_embeddings]
+            embeddings.extend(batch_embeddings_list)
+            
+            total_tokens += sum(len(text) // 1.5 for text in batch_texts)
+        
+        usage = {
+            "total_tokens": int(total_tokens),
+            "total_texts": len(texts)
+        }
+        
+        return embeddings, usage
     
     def generate_response(
         self, 
@@ -188,11 +244,11 @@ model_manager = ModelManager()
 # === FastAPI App with Lifespan ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """앱 시작 시 모델 로드, 종료 시 정리"""
     # Startup
     model_name = "K-intelligence/Midm-2.0-Mini-Instruct"
     try:
         model_manager.load_model(model_name)
+        model_manager.load_embedding_model()
     except Exception as e:
         print(f"Failed to load model: {e}")
         raise
@@ -204,6 +260,8 @@ async def lifespan(app: FastAPI):
     if model_manager.model is not None:
         del model_manager.model
         del model_manager.tokenizer
+    if model_manager.embedding_model is not None:
+        del model_manager.embedding_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -228,13 +286,15 @@ app.add_middleware(
 # === API Endpoints ===
 @app.get("/")
 async def root():
-    """헬스 체크 및 API 정보"""
     return {
         "service": "Midm Mini Model API",
         "status": "running",
         "model_loaded": model_manager.model is not None,
+        "embedding_model_loaded": model_manager.embedding_model is not None,
         "endpoints": {
             "chat": "/chat",
+            "chat_stream": "/chat/stream",
+            "embeddings": "/embeddings",
             "health": "/health",
             "docs": "/docs"
         }
@@ -243,10 +303,15 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """서버 및 모델 상태 확인"""
+    embedding_dimensions = None
+    if model_manager.embedding_model is not None:
+        embedding_dimensions = model_manager.embedding_model.get_sentence_embedding_dimension()
+    
     return {
         "status": "healthy",
         "model_loaded": model_manager.model is not None,
+        "embedding_model_loaded": model_manager.embedding_model is not None,
+        "embedding_dimensions": embedding_dimensions,
         "device": model_manager.device,
         "cuda_available": torch.cuda.is_available()
     }
@@ -254,11 +319,6 @@ async def health_check():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """
-    채팅 완성 엔드포인트
-    
-    채팅 히스토리를 받아서 다음 응답을 생성합니다.
-    """
     try:
         messages = [msg.model_dump() for msg in request.messages]
         
@@ -280,11 +340,6 @@ async def chat(request: ChatRequest):
 
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """
-    SSE 기반 스트리밍 채팅 엔드포인트
-    
-    Server-Sent Events를 통해 실시간으로 토큰을 스트리밍합니다.
-    """
     async def generate_sse():
         try:
             messages = [msg.model_dump() for msg in request.messages]
