@@ -401,6 +401,30 @@ async def chat_stream(request: ChatRequest):
     )
 
 
+@app.post("/embeddings", response_model=EmbeddingResponse)
+async def create_embeddings(request: EmbeddingRequest):
+    try:
+        if not request.texts:
+            raise HTTPException(status_code=400, detail="No texts provided")
+        
+        embeddings, usage = model_manager.generate_embeddings(request.texts)
+        
+        dimensions = model_manager.embedding_model.get_sentence_embedding_dimension()
+        model_name = request.model or "jhgan/ko-sroberta-multitask"
+        
+        return EmbeddingResponse(
+            embeddings=embeddings,
+            model=model_name,
+            dimensions=dimensions,
+            usage=usage
+        )
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # === Main Entry Point ===
 if __name__ == "__main__":
     uvicorn.run(
